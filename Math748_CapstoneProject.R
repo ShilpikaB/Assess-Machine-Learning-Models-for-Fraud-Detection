@@ -7,6 +7,8 @@ library(caret)
 library(dplyr)
 library(lubridate)
 library(glmnet)
+library(FSinR)
+library(ggcorrplot)
 
 #---------------------  FUNCTIONS  ---------------------
 # Remove columns with more than a threshold (60%) missing data
@@ -112,6 +114,10 @@ ds["Order_month"] = format(as.Date(ds$order_date, format="%m/%d/%Y"),"%m")
 unique(ds$Order_month)
 ds["Order_day"] = weekdays(as.Date(ds$order_date, format="%m/%d/%Y"))
 unique(ds$Order_day)
+ds["Shipping_month"] = format(as.Date(ds$shipping_date, format="%m/%d/%Y"),"%m")
+unique(ds$Shipping_month)
+ds["Shipping_day"] = weekdays(as.Date(ds$shipping_date, format="%m/%d/%Y"))
+unique(ds$Shipping_day)
 #View(ds)
 #summary(ds)
 
@@ -136,18 +142,54 @@ ds_fraud = ds_cleaned%>%
 ds_fraud = as.data.frame(ds_fraud)
 
 #-----------
-# Convert everything to numeric
+# Convert data set to numeric
 #----------- 
 ds_fraud_mat = data.matrix(data.frame(unclass(ds_fraud))) 
 ds_fraud_frm = as.data.frame(ds_fraud_mat)
 contrasts(as.factor(ds_fraud$Type))
 
-#-----------
-# Standardized features 
-#-----------  
-#y_resp = train_ds_dwn$response_fraud
-#ds_fraud_scaled = apply(ds_fraud, 2, function(y_resp) (y_resp - mean(y_resp)) / sd(y_resp) ^ as.logical(sd(y_resp)))
 
+#-----------
+######################### FEATURE SELECTION ########################
+#----------- 
+summary(ds_fraud)
+categorical_var = c(1,2,3,6,7,8,9,10,11,15,16,17,18,19,20,23,24,25,31,38,39,41,42,44,45,46,47,48,49)
+quantitative_car = c(4,5,13,21,22,26,27,28,29,30,32,33,34,35,36,37,40,43,49) #12,14
+
+
+#----------- 
+# Filter Method: Using filterVarImp() function
+#----------- 
+#use roc_curve area as score
+roc_imp = filterVarImp(x = ds_fraud_frm, y = ds_fraud_frm$response_fraud)
+
+#sort the score in decreasing order
+roc_imp = data.frame(cbind(variable = rownames(roc_imp), score = roc_imp[,1]))
+roc_imp$score = as.double(roc_imp$score)
+roc_imp[order(roc_imp$score,decreasing = TRUE),]
+
+#-----------
+# Filter Method: using correlation coefficients on quantitative variables
+#----------- 
+#View(ds_fraud_frm[,quantitative_car])
+cor_matrix = data.frame(cor(ds_fraud_frm[,quantitative_car]))
+dim(cor_matrix)
+
+summary(abs(cor_matrix[,dim(cor_matrix)[2]]))
+ggcorrplot(cor_matrix)+ggtitle("Heat Map of Quantitative Variables against Transaction Type (Fraud/Not Fraud)")
+colnames(ds_fraud_frm[,quantitative_car])[which(cor_matrix[,dim(cor_matrix)[2]]>=0.05)]
+
+#-----------
+# Filter Method: using correlation coefficients on categorical variables
+#----------- 
+cor_matrix = data.frame(cor(ds_fraud_frm[,categorical_var]))
+dim(cor_matrix)
+
+summary(abs(cor_matrix[,dim(cor_matrix)[2]]))
+corrplot = ggcorrplot(cor_matrix)+
+  ggtitle("Heat Map of Categorical Variables against Transaction Type (Fraud/Not Fraud)")
+corrplot
+colnames(ds_fraud_frm[,quantitative_car])[which(cor_matrix[,dim(cor_matrix)[2]]>=0.05)]
 
 #-------------
 # Splitting the data into Training and Test sets
@@ -161,15 +203,13 @@ train_ds = ds_fraud_frm[train_idx,]
 
 test_ds = ds_fraud_frm[-train_idx,]
 #dim(test_ds)
-
-
-
+table(train_ds_Up$response_fraud)
 
 #-------------
 # Up-sampling the minority class "Suspected_Fraud"
 #-------------
 train_ds_Up = UpSampling(train_ds, "response_fraud")
-table(train_ds_Up$response_fraud)
+table(train_ds$response_fraud)
 
 #-------------
 # Down-sampling the majority classes to the minority class "Suspected_Fraud" frequency
@@ -180,36 +220,18 @@ dim(train_ds_dwn)
 
 unique(train_ds_dwn$response_fraud)
 
-#correlations
-d = ds_cleaned[,c(2,3,4,5,10,11,12,13,14,15)]
-cm = cor(d, method="pearson")
-library(corrplot)
-library(RColorBrewer)
-col<-colorRampPalette(c("#BB4444","#EE9988","#FFFFFF","#77AADD","#4477AA"))
-corrplot(cm,method="color",col=col(50),type="upper",order="hclust",
-         addCoef.col="black",tl.col="black",tl.srt=45,number.cex=0.7)
+#-------------
+# WRAPPER FEATURE SELECTION: Step-wise
+#-------------
+# Fit the full model 
+full.model = lm(response_fraud ~., data = train_ds_dwn)
+# Stepwise regression model
+step.model = stepAIC(full.model, direction = "both", 
+                      trace = FALSE)
+summary(step.model)
 
 #-------------
-# Logistic Regression
-#-------------
-#
-y_resp = train_ds_dwn$response_fraud
-#
-w = ifelse(y_resp==1,(1/table(y_resp)[1])*0.999,(1/table(y_resp)[2])*0.001)
-
-log.fit=glm(response_fraud~., data=train_ds_dwn, family=binomial(link="logit"), weights=w)
-#summary(log.fit)
-
-log.prob = predict(log.fit, newdata = test_ds, scale=1, type="response")
-log.prob[1:10]
-log.pred = rep(0,length(log.prob))
-log.pred[log.prob>0.5] = 1
-
-table(log.pred, test_ds$response_fraud)
-mean(log.pred == test_ds$response_fraud)
-
-#-------------
-# Lasso Regression
+# EMBEDDED FEATURE SELECTION: Lasso Regression
 #-------------
 X = model.matrix(response_fraud~.,train_ds_dwn)[,-1]
 colnames(X)
@@ -221,44 +243,76 @@ cv.lasso = cv.glmnet(x=X, y=train_ds_dwn$response_fraud, alpha=1,
                      family=binomial(link="logit"), nfolds=5)
 
 plot(cv.lasso)
-bestlam=cv.lasso$lambda.1se
+bestlam=cv.lasso$lambda.min
 bestlam
+#cv.lasso$lambda.1se
+#cv.lasso$lambda.min
 
 lasso.fit = glmnet(x=X, y=train_ds_dwn$response_fraud, alpha=1, family=binomial(link="logit"),
                    lambda=bestlam)
-lasso.fit
-
-lasso_pred = predict(lasso.fit, newdata=test_ds, type="coefficients")
-sqrt(mean((lasso.pred-y.test)^2)) #lower than OLS error:193253
-out=glmnet(x,y,alpha=1,lambda=grid)
-lasso.coef=predict(out,type="coefficients",s=bestlam)[1:20,]
-lasso.coef
-lasso.coef[lasso.coef!=0]
-
-X = train_ds_dwn%>%
-  dplyr::select(-Order_Status)
-X.bm = as.matrix(X)
-# lasso, default
-par(mfrow=c(1,2))
-fit.lasso = biglasso(X.bm, y=X.bm$response_fraud, family = 'gaussian')
-plot(fit.lasso, log.l = TRUE, main = 'lasso')
-fit.lasso
+summary(lasso.fit)
 
 
-grid=10^seq(10,-2,length=100) #grid of lambda
-lasso_fraud.mod=glmnet(train_fraud, train_ds_dwn$response_fraud, 
-                 alpha=1,lambda=grid, family="binomial")
-plot(lasso_fraud.mod)#coefficient plot
-set.seed(1)
-cv.out=cv.glmnet(train_fraud, train_ds_dwn$response_fraud,alpha=1, family="binomial")
-plot(cv.out)#CV error plot
-bestlam=cv.out$lambda.min #cv.out$lambda.1se
-lasso.pred=predict(lasso.mod,s=bestlam,newx=x[test,])
-sqrt(mean((lasso.pred-y.test)^2)) #lower than OLS error:193253
-out=glmnet(x,y,alpha=1,lambda=grid)
-lasso.coef=predict(out,type="coefficients",s=bestlam)[1:20,]
-lasso.coef
-lasso.coef[lasso.coef!=0]
+lasso_pred = predict(lasso.fit, newx=as.matrix(test_ds[,-49]), type="response")
+lasso_class = rep(0,length(lasso_pred))
+lasso_class[lasso_pred>=0.5]==1
+table(lasso_class)
+
+mean(!=test_ds$response_fraud)
+
+
+lasso.coef=predict(lasso.fit, newx=as.matrix(test_ds[,-49]), type="coefficients")
+colnames(ds_fraud_frm)[lasso.coef[lasso.coef!=0]
+
+
+
+#-------------
+# Logistic Regression
+#-------------
+#
+#y_resp = train_ds_dwn$response_fraud
+#
+#w = ifelse(y_resp==1,(1/table(y_resp)[1])*0.999,(1/table(y_resp)[2])*0.001)
+View(ds_fraud)
+#unique(ds_fraud$Days_for_shipping_real,ds_fraud$Shipping_day)
+ds_fraud%>%
+  dplyr::group_by(Delivery_Status)%>%
+  dplyr::filter(response_fraud==1)%>%
+  dplyr::summarise(n())
+
+set.seed(81)
+log.fit=glm(response_fraud~., data=train_ds_dwn, family=binomial(link="logit"))
+summary(log.fit)
+signicoef_log.fit = data.frame(summary(log.fit)$coef[summary(log.fit)$coef[,4] <= .05, 1])
+colnames(signicoef_log.fit) = c("Coefficients of Significant Features")
+signicoef_log.fit
+
+View(ds_fraud)
+unique(ds_fraud$Days_for_shipping_real)
+table(ds_fraud_frm$Days_for_shipping_real)
+unique(ds_fraud_frm$Delivery_Status)
+unique(ds_fraud$Delivery_Status)
+unique(ds_fraud_frm$Customer_Segment)
+table(ds_fraud$Customer_Segment)
+unique(ds_fraud$Order_Region)
+unique(ds_fraud$Product_Name)
+unique(ds_fraud$Shipping_Mode)
+
+contrasts(as.factor(ds_fraud$Days_for_shipping_real))
+contrasts(as.factor(ds_fraud$Delivery_Status))
+contrasts(as.factor(ds_fraud$Order_Region))
+contrasts(as.factor(ds_fraud$Product_Name))
+contrasts(as.factor(ds_fraud$Shipping_Mode))
+
+
+log.prob = predict(log.fit, newdata = test_ds, scale=1, type="response")
+log.prob[1:10]
+log.pred = rep(0,length(log.prob))
+log.pred[log.prob>0.5] = 1
+
+table(log.pred, test_ds$response_fraud)
+mean(log.pred == test_ds$response_fraud)
+
 
 ##########################################################################
 #-------------
