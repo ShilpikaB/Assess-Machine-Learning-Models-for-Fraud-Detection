@@ -9,6 +9,9 @@ library(lubridate)
 library(glmnet)
 library(FSinR)
 library(ggcorrplot)
+library(prcomp) #pca
+library(ggfortify) #plotting pca results
+library(latex2exp)
 
 #---------------------  FUNCTIONS  ---------------------
 # Remove columns with more than a threshold (60%) missing data
@@ -81,6 +84,25 @@ DownSampling = function(df,y){
   df_majority_downsized = sample_n(df_majority, y_minority_count, replace=FALSE)
   
   return(rbind(df[df[y]==1,],df_majority_downsized))
+}
+
+# Lasso Model
+lasso_model = function(X, y, family_type){
+  set.seed(81)
+  grid=10^seq(10, -2,length=100) #grid of lambda
+  
+  # using 5-fold cross-validation
+  cv.lasso = cv.glmnet(x=X, y=y, alpha=1, 
+                       family=family_type, nfolds=5)
+  
+  plot(cv.lasso)
+  bestlam=cv.lasso$lambda.1se
+  
+  # using lambda.1se
+  lasso.fit = glmnet(x=X, y=y, alpha=1, 
+                     family=family_type, lambda=bestlam)
+  return(lasso.fit)
+  
 }
 
 #------------------------------------------------------------
@@ -167,6 +189,9 @@ roc_imp = filterVarImp(x = ds_fraud_frm, y = ds_fraud_frm$response_fraud)
 roc_imp = data.frame(cbind(variable = rownames(roc_imp), score = roc_imp[,1]))
 roc_imp$score = as.double(roc_imp$score)
 roc_imp[order(roc_imp$score,decreasing = TRUE),]
+var1 = roc_imp$variable[roc_imp$score>2]
+filter_method1_var = var1[-15]
+filter_method1_var
 
 #-----------
 # Filter Method: using correlation coefficients on quantitative variables
@@ -197,13 +222,13 @@ colnames(ds_fraud_frm[,quantitative_car])[which(cor_matrix[,dim(cor_matrix)[2]]>
 split_val = 0.7
 total_len = dim(ds_fraud_frm)[1]
 
+set.seed(25)
 train_idx = sample(total_len, total_len*split_val)
 train_ds = ds_fraud_frm[train_idx,]
 #dim(train_ds)
 
 test_ds = ds_fraud_frm[-train_idx,]
 #dim(test_ds)
-table(train_ds_Up$response_fraud)
 
 #-------------
 # Up-sampling the minority class "Suspected_Fraud"
@@ -214,6 +239,7 @@ table(train_ds$response_fraud)
 #-------------
 # Down-sampling the majority classes to the minority class "Suspected_Fraud" frequency
 #-------------
+table(train_ds$response_fraud)
 train_ds_dwn = DownSampling(train_ds, "response_fraud")
 table(train_ds_dwn$response_fraud)
 dim(train_ds_dwn)
@@ -226,44 +252,72 @@ unique(train_ds_dwn$response_fraud)
 # Fit the full model 
 full.model = lm(response_fraud ~., data = train_ds_dwn)
 # Stepwise regression model
-step.model = stepAIC(full.model, direction = "both", 
-                      trace = FALSE)
-summary(step.model)
+stepmodel_summary = summary(stepAIC(full.model, direction = "both", 
+                      trace = FALSE))
+
+wrapper_var = names(which(stepmodel_summary$coefficients[,4]<0.05))[-1]
+wrapper_var
 
 #-------------
-# EMBEDDED FEATURE SELECTION: Lasso Regression
+# EMBEDDED FEATURE SELECTION: Lasso
 #-------------
 X = model.matrix(response_fraud~.,train_ds_dwn)[,-1]
-colnames(X)
-dim(X)
+
+# Fit Lasso Model
+lasso.fit = lasso_model(X, train_ds_dwn$response_fraud, "binomial")
+Lasso_var = colnames(train_ds_dwn)[abs(coef(lasso.fit)[,1])>0]
+Lasso_var  # significant variables identified using Lasso
+
+# Lasso on Test data
+lasso_pred = predict(lasso.fit, newx=as.matrix(test_ds[,-49]), type="response")
+dim(lasso_pred)
+lasso_class = rep(0,length(lasso_pred))
+lasso_class[lasso_pred>=0.5] = 1
+table(lasso_class, test_ds$response_fraud)
+
+# Calculate Test Error
+TestErr_Lasso = mean(lasso_class != test_ds$response_fraud)
+TestErr_Lasso
+
+#-------------
+# Principle Component Analysis PCA
+#-------------
+#PCA on predictors
+table(ds_fraud_frm$response_fraud)
+ds_fraud_dwn = DownSampling(ds_fraud_frm, "response_fraud")
+table(ds_fraud_dwn$response_fraud)
+dim(ds_fraud_dwn)
+
+fraud_data.pca = prcomp(ds_fraud_dwn, scale=T)
+fraud.pcs_summary = summary(fraud_data.pca)
+
+
+#elbow point of scree plot
+plot(fraud_data.pca$sdev^2, xlab = TeX("Principal Components  ($\\lambda$)"),
+     ylab = "Proportion of Variance Explained",
+     type = "b", main="Scree plot to identify the Elbow point",
+     lwd=2, bg = 1, col = rainbow(50),
+     xlim=c(1,dim(ds_fraud_dwn)[2]))
+
+# Threshold the proportion of max variance explained to 90%
+imp_pca.fraud = fraud.pcs_summary$importance
+pca_len.fraud = length(which(imp_pca.fraud[3,]<=0.9))
+pca_len.fraud
 
 set.seed(81)
-grid=10^seq(10, -2,length=100) #grid of lambda
-cv.lasso = cv.glmnet(x=X, y=train_ds_dwn$response_fraud, alpha=1, 
-                     family=binomial(link="logit"), nfolds=5)
+pca.ds_fraud = data.frame(fraud_data.pca$x[,1:pca_len.fraud])
+pca_fraud.glmfit = glm(ds_fraud_dwn$response_fraud~., 
+                   data=pca.ds_fraud, family=binomial(link="logit"))
 
-plot(cv.lasso)
-bestlam=cv.lasso$lambda.min
-bestlam
-#cv.lasso$lambda.1se
-#cv.lasso$lambda.min
+y.pred = predict(pca_fraud.glmfit, newdata = scores[-train,])
+y.test = Hitters$Salary[-train]
+sqrt(mean((y.pred-y.test)^2)) #RMSE
 
-lasso.fit = glmnet(x=X, y=train_ds_dwn$response_fraud, alpha=1, family=binomial(link="logit"),
-                   lambda=bestlam)
-summary(lasso.fit)
-
-
-lasso_pred = predict(lasso.fit, newx=as.matrix(test_ds[,-49]), type="response")
-lasso_class = rep(0,length(lasso_pred))
-lasso_class[lasso_pred>=0.5]==1
-table(lasso_class)
-
-mean(!=test_ds$response_fraud)
-
-
-lasso.coef=predict(lasso.fit, newx=as.matrix(test_ds[,-49]), type="coefficients")
-colnames(ds_fraud_frm)[lasso.coef[lasso.coef!=0]
-
+#regular lm
+lm.fit0 <- lm(Salary~.,data=Hitters,subset=train)
+y.pred0 <- predict(lm.fit0,newdata = Hitters[-train,])
+y.test <- Hitters$Salary[-train]
+sqrt(mean((y.pred0-y.test)^2)) 
 
 
 #-------------
